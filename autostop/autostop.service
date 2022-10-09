@@ -1,0 +1,8 @@
+[Unit]
+Description=Automatically shuts down the server when there's no activity
+
+[Service]
+ExecStart=/usr/bin/autostop 10m /usr/bin/systemctl poweroff
+
+[Install]
+WantedBy=multi-user.target

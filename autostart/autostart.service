@@ -1,0 +1,10 @@
+[Unit]
+Description=Automatically starts servers when they receive traffic
+
+[Service]
+ExecStart=/usr/bin/autostart wg0
+Environment=AWS_DEFAULT_REGION=us-east-1
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
