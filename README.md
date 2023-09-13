@@ -45,6 +45,14 @@ Usage:
 
 Example: `/usr/bin/autostop 10m /usr/bin/systemctl poweroff`
 
+Easy install script:
+```
+sudo curl -L "https://github.com/ericpauley/ec2-autostart/releases/latest/download/autostop-`uname -m`" -o /usr/bin/autostop
+chmod +x /usr/bin/autostop
+sudo curl -L "https://github.com/ericpauley/ec2-autostart/releases/latest/download/autostop.service" -o /etc/systemd/system/autostop.service
+sudo systemctl enable autostop.service && sudo systemctl start autostop.service
+```
+
 ## Ending inactive ssh sessions
 
 Most default `sshd` configurations will not end inactive sessions, such as if you close your laptop without explicitly closing SSH or VSCode. The following lines in `sshd_config` will end these sessions (after roughly 3*60=180 seconds):
