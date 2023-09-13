@@ -45,12 +45,12 @@ Usage:
 
 Example: `/usr/bin/autostop 10m /usr/bin/systemctl poweroff`
 
-Easy install script:
+Easy install script (run as root):
 ```
-sudo curl -L "https://github.com/ericpauley/ec2-autostart/releases/latest/download/autostop-`uname -m`" -o /usr/bin/autostop
+curl -L "https://github.com/ericpauley/ec2-autostart/releases/latest/download/autostop-`uname -m`" -o /usr/bin/autostop
 chmod +x /usr/bin/autostop
-sudo curl -L "https://github.com/ericpauley/ec2-autostart/releases/latest/download/autostop.service" -o /etc/systemd/system/autostop.service
-sudo systemctl enable autostop.service && sudo systemctl start autostop.service
+curl -L "https://github.com/ericpauley/ec2-autostart/releases/latest/download/autostop.service" -o /etc/systemd/system/autostop.service
+systemctl enable autostop.service && systemctl start autostop.service
 ```
 
 ## Ending inactive ssh sessions
