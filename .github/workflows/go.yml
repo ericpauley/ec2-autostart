@@ -27,6 +27,7 @@ jobs:
       run: GOARCH=arm64 go build -o ./autostop/autostop-arm64 ./autostop/autostop.go
     - name: Release
       uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')
       with:
         files: |
             autostop/autostop-x86_64
