@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"sync"
@@ -10,23 +14,65 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcap"
 )
 
-var ec2Svc *ec2.Client
+var accounts Accounts
 
-var lastEc2DataAt time.Time
+type Accounts struct {
+	Mapping []Mapping `json:"accounts"`
+}
 
-var lastEc2Data *ec2.DescribeInstancesOutput
-var lastEc2Err error
+type Mapping struct {
+	IPrange       string                       `json:"ipRange"`
+	ARNrole       string                       `json:"arnRole"`
+	lastEc2DataAt time.Time                    `json:"-"`
+	lastEc2Data   *ec2.DescribeInstancesOutput `json:"-"`
+	lastEc2Err    error                        `json:"-"`
+	ec2Svc        *ec2.Client                  `json:"-"`
+}
 
-func GetEC2Data() (*ec2.DescribeInstancesOutput, error) {
+func LoadMapping(filePath string) error {
+	// Load mapping JSON config file and parse it
+	jsonFile, err := os.Open(filePath)
+	if err != nil {
+		log.Printf("error opening mapping.json file, %v", err)
+		return err
+	} else {
+		defer jsonFile.Close()
+
+		byteValue, _ := io.ReadAll(jsonFile)
+		json.Unmarshal(byteValue, &accounts)
+
+		return nil
+	}
+
+}
+
+func GetMappingFromIP(ip string) (*Mapping, error) {
+	// return corresponding mapping for specified IP
+	for i := 0; i < len(accounts.Mapping); i++ {
+		_, subnet, err := net.ParseCIDR(accounts.Mapping[i].IPrange)
+		if err != nil {
+			return nil, errors.New("error parsing network")
+		}
+
+		if subnet.Contains(net.ParseIP(ip)) {
+			return &accounts.Mapping[i], nil
+		}
+	}
+	return nil, errors.New("ip block not found in mapping.json file")
+}
+
+func GetEC2Data(mapping *Mapping) (*ec2.DescribeInstancesOutput, error) {
 	// Cache EC2 instance data for 5s
-	if lastEc2DataAt.Add(5 * time.Second).After(time.Now()) {
-		return lastEc2Data, lastEc2Err
+	if mapping.lastEc2DataAt.Add(5 * time.Second).After(time.Now()) {
+		return mapping.lastEc2Data, mapping.lastEc2Err
 	}
 
 	input := &ec2.DescribeInstancesInput{
@@ -39,9 +85,9 @@ func GetEC2Data() (*ec2.DescribeInstancesOutput, error) {
 			},
 		},
 	}
-	lastEc2Data, lastEc2Err = ec2Svc.DescribeInstances(context.TODO(), input)
-	lastEc2DataAt = time.Now()
-	return lastEc2Data, lastEc2Err
+	mapping.lastEc2Data, mapping.lastEc2Err = mapping.ec2Svc.DescribeInstances(context.TODO(), input)
+	mapping.lastEc2DataAt = time.Now()
+	return mapping.lastEc2Data, mapping.lastEc2Err
 }
 
 var suppressions map[string]struct{}
@@ -83,7 +129,12 @@ func main() {
 		log.Fatalf("unable to load SDK config, %v", err)
 	}
 
-	ec2Svc = ec2.NewFromConfig(cfg)
+	//Load Account Network Mapping
+	err = LoadMapping(os.Args[2])
+	if err != nil {
+		log.Fatalf("unable to load mapping config, %v", err)
+	}
+
 	handle, err := pcap.OpenLive(os.Args[1], 1600, true, pcap.BlockForever)
 	if err != nil {
 		panic(err)
@@ -94,10 +145,30 @@ func main() {
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	for packet := range packetSource.Packets() {
 		dst := packet.NetworkLayer().NetworkFlow().Dst()
-		instances, err := GetEC2Data()
+
+		mapping, err := GetMappingFromIP(dst.String())
+		if err != nil {
+			log.Println("Failed to get Mapping from IP", err)
+		}
+
+		if mapping.ARNrole == "Ec2InstanceMetadata" {
+			//We use IAM role attached to the instance
+			mapping.ec2Svc = ec2.NewFromConfig(cfg)
+
+		} else {
+			// We assume ARN role
+			stsSvc := sts.NewFromConfig(cfg)
+			creds := stscreds.NewAssumeRoleProvider(stsSvc, mapping.ARNrole)
+			cfg.Credentials = aws.NewCredentialsCache(creds)
+
+			mapping.ec2Svc = ec2.NewFromConfig(cfg)
+		}
+
+		instances, err := GetEC2Data(mapping)
 		if err != nil {
 			log.Println("Failed to get EC2 status", err)
 		}
+
 		for _, res := range instances.Reservations {
 			for _, instance := range res.Instances {
 				if *instance.PrivateIpAddress != dst.String() {
@@ -107,7 +178,7 @@ func main() {
 					continue
 				}
 				log.Println("Starting", dst.String(), instance.InstanceId)
-				_, err := ec2Svc.StartInstances(context.TODO(), &ec2.StartInstancesInput{InstanceIds: []string{*instance.InstanceId}})
+				_, err := mapping.ec2Svc.StartInstances(context.TODO(), &ec2.StartInstancesInput{InstanceIds: []string{*instance.InstanceId}})
 				if err != nil {
 					log.Println("Failed to start instance", err)
 				} else {
@@ -115,7 +186,7 @@ func main() {
 				}
 
 				// Force refresh of EC2 instance data
-				lastEc2DataAt = time.Time{}
+				mapping.lastEc2DataAt = time.Time{}
 
 			}
 		}
