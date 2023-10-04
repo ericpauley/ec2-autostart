@@ -1,0 +1,16 @@
+{
+    "accounts": [
+        {
+            "ipRange": "192.0.2.0/24",
+            "arnRole": "Ec2InstanceMetadata"
+        },
+        {
+            "ipRange": "198.51.100.0/24 ",
+            "arnRole": "Ec2InstanceMetadata"
+        },
+        {
+            "ipRange": "203.0.113.0/24",
+            "arnRole": "arn:aws:iam::<NEW-ACCOUNT-ID>:role/<NEW-ACCOUNT-IAM-AUTOSTART-ROLE>"
+        }
+    ]
+}

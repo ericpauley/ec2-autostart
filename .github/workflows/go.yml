@@ -27,7 +27,7 @@ jobs:
 
     - name: Build x86
       run: GOARCH=amd64 go build -o ./autostop/autostop-x86_64 ./autostop/autostop.go
-    - name: Build x86
+    - name: Build arm
       run: GOARCH=arm64 go build -o ./autostop/autostop-arm64 ./autostop/autostop.go
     - name: Release
       uses: softprops/action-gh-release@v1
