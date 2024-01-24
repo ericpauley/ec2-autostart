@@ -90,7 +90,7 @@ func GetEC2Data(mapping *Mapping) (*ec2.DescribeInstancesOutput, error) {
 	return mapping.lastEc2Data, mapping.lastEc2Err
 }
 
-var suppressions map[string]struct{}
+var suppressions = make(map[string]struct{})
 var suppressionLock sync.Mutex
 
 func suppressRefused(ip string) {
@@ -148,7 +148,8 @@ func main() {
 
 		mapping, err := GetMappingFromIP(dst.String())
 		if err != nil {
-			log.Println("Failed to get Mapping from IP", err)
+			log.Println("Failed to get Mapping from IP", dst.String(), err)
+			continue
 		}
 
 		if mapping.ARNrole == "Ec2InstanceMetadata" {
