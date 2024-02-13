@@ -41,7 +41,7 @@ func main() {
 		}
 		for _, rootProcId := range tree.Procs[1].Children {
 			screen := tree.Procs[rootProcId]
-			if screen.Name != "screen" {
+			if screen.Name != "screen" && screen.Name != "tmux: server" {
 				continue
 			}
 			// Screen has to be running something (like a shell) that is running something else
