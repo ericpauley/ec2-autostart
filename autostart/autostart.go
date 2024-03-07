@@ -6,7 +6,7 @@ import (
 	"errors"
 	"io"
 	"log"
-	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"sync"
@@ -18,8 +18,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/pcap"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/afpacket"
+	"github.com/gopacket/gopacket/layers"
 )
 
 var accounts Accounts
@@ -29,7 +30,7 @@ type Accounts struct {
 }
 
 type Mapping struct {
-	IPrange       string                       `json:"ipRange"`
+	IPrange       netip.Prefix                 `json:"ipRange"`
 	ARNrole       string                       `json:"arnRole"`
 	lastEc2DataAt time.Time                    `json:"-"`
 	lastEc2Data   *ec2.DescribeInstancesOutput `json:"-"`
@@ -54,25 +55,34 @@ func LoadMapping(filePath string) error {
 
 }
 
-func GetMappingFromIP(ip string) (*Mapping, error) {
+func GetMappingFromIP(ip netip.Addr) (*Mapping, error) {
 	// return corresponding mapping for specified IP
-	for i := 0; i < len(accounts.Mapping); i++ {
-		_, subnet, err := net.ParseCIDR(accounts.Mapping[i].IPrange)
-		if err != nil {
-			return nil, errors.New("error parsing network")
-		}
+	for _, mapping := range accounts.Mapping {
 
-		if subnet.Contains(net.ParseIP(ip)) {
-			return &accounts.Mapping[i], nil
+		if mapping.IPrange.Contains(ip) {
+			return &mapping, nil
 		}
 	}
 	return nil, errors.New("ip block not found in mapping.json file")
 }
 
-func GetEC2Data(mapping *Mapping) (*ec2.DescribeInstancesOutput, error) {
+func GetEC2Data(mapping *Mapping, cfg aws.Config) (*ec2.DescribeInstancesOutput, error) {
 	// Cache EC2 instance data for 5s
 	if mapping.lastEc2DataAt.Add(5 * time.Second).After(time.Now()) {
 		return mapping.lastEc2Data, mapping.lastEc2Err
+	}
+
+	if mapping.ARNrole == "Ec2InstanceMetadata" {
+		//We use IAM role attached to the instance
+		mapping.ec2Svc = ec2.NewFromConfig(cfg)
+
+	} else {
+		// We assume ARN role
+		stsSvc := sts.NewFromConfig(cfg)
+		creds := stscreds.NewAssumeRoleProvider(stsSvc, mapping.ARNrole)
+		cfg.Credentials = aws.NewCredentialsCache(creds)
+
+		mapping.ec2Svc = ec2.NewFromConfig(cfg)
 	}
 
 	input := &ec2.DescribeInstancesInput{
@@ -135,44 +145,58 @@ func main() {
 		log.Fatalf("unable to load mapping config, %v", err)
 	}
 
-	handle, err := pcap.OpenLive(os.Args[1], 1600, true, pcap.BlockForever)
+	tpacket, err := afpacket.NewTPacket()
+	// handle, err := pcap.OpenLive(os.Args[1], 1600, true, pcap.BlockForever)
 	if err != nil {
 		panic(err)
 	}
-	if err := handle.SetBPFFilter("tcp[tcpflags] & tcp-syn != 0 or icmp"); err != nil { // optional
-		panic(err)
-	}
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	for packet := range packetSource.Packets() {
-		dst := packet.NetworkLayer().NetworkFlow().Dst()
+	var eth layers.Ethernet
+	var ip4 layers.IPv4
+	var tcp layers.TCP
+	decoded := []gopacket.LayerType{}
 
-		mapping, err := GetMappingFromIP(dst.String())
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip4, &tcp)
+
+	for {
+		data, _, err := tpacket.ZeroCopyReadPacketData()
 		if err != nil {
-			log.Println("Failed to get Mapping from IP", dst.String(), err)
+			log.Fatal("Error reading packet", err)
+		}
+
+		tcp.SYN = false // Ensure the decoder below MUST set the TCP layer to continue
+
+		parser.DecodeLayers(data, &decoded)
+
+		if !(tcp.SYN && !tcp.ACK) {
+			continue // Only process SYN Packets
+		}
+
+		dst, ok := netip.AddrFromSlice(ip4.DstIP)
+		if !ok {
+			log.Println("Failed to parse IP", ip4.DstIP)
 			continue
 		}
 
-		if mapping.ARNrole == "Ec2InstanceMetadata" {
-			//We use IAM role attached to the instance
-			mapping.ec2Svc = ec2.NewFromConfig(cfg)
-
-		} else {
-			// We assume ARN role
-			stsSvc := sts.NewFromConfig(cfg)
-			creds := stscreds.NewAssumeRoleProvider(stsSvc, mapping.ARNrole)
-			cfg.Credentials = aws.NewCredentialsCache(creds)
-
-			mapping.ec2Svc = ec2.NewFromConfig(cfg)
+		mapping, err := GetMappingFromIP(dst)
+		if err != nil {
+			// This happens for traffic to any public IP. Disregard.
+			continue
 		}
 
-		instances, err := GetEC2Data(mapping)
+		instances, err := GetEC2Data(mapping, cfg)
 		if err != nil {
 			log.Println("Failed to get EC2 status", err)
 		}
 
 		for _, res := range instances.Reservations {
 			for _, instance := range res.Instances {
+				if instance.PrivateIpAddress == nil {
+					continue
+				}
 				if *instance.PrivateIpAddress != dst.String() {
+					continue
+				}
+				if instance.State == nil {
 					continue
 				}
 				if instance.State.Name != "stopped" {
