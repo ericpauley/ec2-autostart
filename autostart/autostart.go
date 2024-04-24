@@ -6,11 +6,14 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/exec"
 	"sync"
 	"time"
+
+	_ "net/http/pprof"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -134,6 +137,12 @@ func suppressRefused(ip string) {
 }
 
 func main() {
+	if os.Getenv("PPROF_ADDR") != "" {
+		go func() {
+			log.Println("Listening for profiling on", os.Getenv("PPROF_ADDR"))
+			log.Println(http.ListenAndServe(os.Getenv("PPROF_ADDR"), nil))
+		}()
+	}
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
 		log.Fatalf("unable to load SDK config, %v", err)
