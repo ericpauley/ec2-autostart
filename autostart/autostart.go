@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/netip"
 	"os"
@@ -45,7 +45,7 @@ func LoadMapping(filePath string) error {
 	// Load mapping JSON config file and parse it
 	jsonFile, err := os.Open(filePath)
 	if err != nil {
-		log.Printf("error opening mapping.json file, %v", err)
+		slog.Error("error opening mapping.json file", "err", err)
 		return err
 	} else {
 		defer jsonFile.Close()
@@ -112,24 +112,24 @@ func suppressRefused(ip string) {
 	if _, ok := suppressions[ip]; ok {
 		return
 	}
-	log.Println("Temporarily suppressing RST from", ip)
+	slog.Info("Temporarily suppressing RST from", "ip", ip)
 	cmd := exec.Command("/usr/sbin/iptables", "-I", "FORWARD", "-p", "tcp", "-s", ip, "--tcp-flags", "ALL", "RST,ACK", "-j", "DROP")
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		log.Printf("Failed to suppress RST from %s: %s", ip, err)
+		slog.Info("Failed to suppress RST", "ip", ip, "err", err)
 	} else {
 		suppressions[ip] = struct{}{}
 	}
 	time.AfterFunc(30*time.Second, func() {
 		suppressionLock.Lock()
 		defer suppressionLock.Unlock()
-		log.Println("Unsuppressing RST from", ip)
+		slog.Info("Unsuppressing RST", "ip", ip)
 		cmd := exec.Command("/usr/sbin/iptables", "-D", "FORWARD", "-p", "tcp", "-s", ip, "--tcp-flags", "ALL", "RST,ACK", "-j", "DROP")
 		cmd.Stdout = os.Stderr
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
-			log.Printf("Failed to unsuppress RST from %s: %s", ip, err)
+			slog.Warn("Failed to unsuppress RST from", "ip", ip, "err", err)
 		} else {
 			delete(suppressions, ip)
 		}
@@ -139,22 +139,27 @@ func suppressRefused(ip string) {
 func main() {
 	if os.Getenv("PPROF_ADDR") != "" {
 		go func() {
-			log.Println("Listening for profiling on", os.Getenv("PPROF_ADDR"))
-			log.Println(http.ListenAndServe(os.Getenv("PPROF_ADDR"), nil))
+			slog.Info("Listening for profiling", "addr", os.Getenv("PPROF_ADDR"))
+			err := http.ListenAndServe(os.Getenv("PPROF_ADDR"), nil)
+			if err != nil {
+				slog.Error("Failed to start pprof server", "err", err)
+			}
 		}()
 	}
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
-		log.Fatalf("unable to load SDK config, %v", err)
+		slog.Error("unable to load SDK config", "err", err)
+		os.Exit(1)
 	}
 
 	//Load Account Network Mapping
 	err = LoadMapping(os.Args[2])
 	if err != nil {
-		log.Fatalf("unable to load mapping config, %v", err)
+		slog.Error("unable to load mapping config", "err", err)
+		os.Exit(1)
 	}
 
-	tpacket, err := afpacket.NewTPacket()
+	tpacket, err := afpacket.NewTPacket(afpacket.OptNumBlocks(32), afpacket.OptBlockTimeout(256*time.Millisecond), afpacket.OptFrameSize(128))
 	// handle, err := pcap.OpenLive(os.Args[1], 1600, true, pcap.BlockForever)
 	if err != nil {
 		panic(err)
@@ -162,59 +167,86 @@ func main() {
 	var eth layers.Ethernet
 	var ip4 layers.IPv4
 	var tcp layers.TCP
+	var arp layers.ARP
 	decoded := []gopacket.LayerType{}
 
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip4, &tcp)
-
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip4, &tcp, &arp)
+	lastPacketLogged := time.Time{}
+	parser.IgnoreUnsupported = true
 	for {
 		data, _, err := tpacket.ZeroCopyReadPacketData()
 		if err != nil {
-			log.Fatal("Error reading packet", err)
+			slog.Error("Error reading packet", "err", err)
+			os.Exit(1)
+		}
+		if time.Since(lastPacketLogged) > 60*time.Second {
+			slog.Debug("Received packet")
+			lastPacketLogged = time.Now()
 		}
 
 		tcp.SYN = false // Ensure the decoder below MUST set the TCP layer to continue
+		arp = layers.ARP{}
 
-		parser.DecodeLayers(data, &decoded)
-
-		if !(tcp.SYN && !tcp.ACK) {
-			continue // Only process SYN Packets
+		err = parser.DecodeLayers(data, &decoded)
+		if err != nil {
+			slog.Warn("Failed to decode packet", "err", err)
+			continue
 		}
-
-		dst, ok := netip.AddrFromSlice(ip4.DstIP)
-		if !ok {
-			log.Println("Failed to parse IP", ip4.DstIP)
+		var dst netip.Addr
+		var ok bool
+		if tcp.SYN && !tcp.ACK {
+			dst, ok = netip.AddrFromSlice(ip4.DstIP)
+			if !ok {
+				slog.Warn("Failed to parse IP", "dstip", ip4.DstIP)
+				continue
+			}
+			slog.Info("Received SYN", "dst", dst.String())
+		} else if arp.Operation == layers.ARPRequest {
+			dst, ok = netip.AddrFromSlice(arp.DstProtAddress)
+			if !ok {
+				slog.Warn("Failed to parse ARP IP", "dstip", arp.DstProtAddress)
+				continue
+			}
+			slog.Info("Received ARP Request", "dst", dst.String())
+		} else {
 			continue
 		}
 
 		mapping, err := GetMappingFromIP(dst)
 		if err != nil {
+			slog.Warn("Failed to get mapping", "ip", dst, "err", err)
 			// This happens for traffic to any public IP. Disregard.
 			continue
 		}
 
 		instances, err := GetEC2Data(mapping, cfg)
 		if err != nil {
-			log.Println("Failed to get EC2 status", err)
+			slog.Error("Failed to get EC2 status", "err", err)
 		}
 
 		for _, res := range instances.Reservations {
 			for _, instance := range res.Instances {
 				if instance.PrivateIpAddress == nil {
+					slog.Warn("Instance has no private IP", "instance", instance.InstanceId)
 					continue
 				}
 				if *instance.PrivateIpAddress != dst.String() {
 					continue
 				}
 				if instance.State == nil {
+					slog.Warn("Instance has no state", "instance", instance.InstanceId)
 					continue
 				}
 				if instance.State.Name != "stopped" {
+					if instance.State.Name != "running" {
+						slog.Info("Instance is neither running nor stopped", "instance", instance.InstanceId, "state", instance.State.Name)
+					}
 					continue
 				}
-				log.Println("Starting", dst.String(), instance.InstanceId)
+				slog.Info("Starting", "dst", dst.String(), "instance", instance.InstanceId)
 				_, err := mapping.ec2Svc.StartInstances(context.TODO(), &ec2.StartInstancesInput{InstanceIds: []string{*instance.InstanceId}})
 				if err != nil {
-					log.Println("Failed to start instance", err)
+					slog.Error("Failed to start instance", "err", err)
 				} else {
 					suppressRefused(dst.String())
 				}

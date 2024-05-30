@@ -40,4 +40,6 @@ jobs:
         files: |
             autostop/autostop-x86_64
             autostop/autostop-arm64
+            autostart/autostart-x86_64
+            autostart/autostart-arm64
             autostop/autostop.service
